@@ -1,0 +1,572 @@
+font = {'fontname': 'Garamond'}
+
+# plot_from_npz.py
+# Loads your saved .npz logs and generates:
+# 1) Training return (mean ± 95% CI)  [DDQN vs DQN]
+# 2) Greedy evaluation return (mean ± 95% CI) [DDQN vs DQN]
+# 3) Overestimation proxy: E[max_a Q(s,a)] on fixed probe states (mean ± 95% CI)
+# 4) Loss stability diagnostic (mean ± 95% CI, log y)
+# 5) DDQN state-space: visitation density + greedy action map (theta vs theta_dot)
+# 6) Summary stats printed for report text
+#
+# Assumes your files are in: runs_cartpole/*.npz
+# Output figures saved to: runs_cartpole/fig_*.png
+
+import os
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+RUN_DIR = "runs_cartpole"       # change if needed
+OUT_DIR = RUN_DIR               # save figures next to runs
+DDQN_GLOB = os.path.join(RUN_DIR, "ddqn_cartpole_seed*.npz")
+DQN_GLOB  = os.path.join(RUN_DIR, "dqn_cartpole_seed*.npz")
+
+SOLVED_THRESHOLD = 195.0
+
+
+def load_runs(pattern):
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f"No files matched: {pattern}")
+    runs = [np.load(p, allow_pickle=True) for p in paths]
+    return runs, paths
+
+def align_min_length(runs, key):
+    lengths = [len(r[key]) for r in runs]
+    if min(lengths) == 0:
+        raise ValueError(f"At least one run has empty '{key}' array. Lengths={lengths}")
+    L = min(lengths)
+    arr = np.stack([r[key][:L] for r in runs], axis=0)
+    return arr
+
+
+
+def mean_ci(arr, z=1.96):         ### Calculate mean across seeds, calculates lower and upper bounds for a 95% CI using a normal approximation 
+    # normal-approx CI; sufficient for 5–10 seeds
+    mean = arr.mean(axis=0)
+    if arr.shape[0] > 1:
+        std = arr.std(axis=0, ddof=1)
+    else:
+        std = np.zeros_like(mean)
+    n = arr.shape[0]
+    half = z * std / np.sqrt(max(n, 1))
+    return mean, mean - half, mean + half
+
+ 
+def first_solved_episode(eval_ep, eval_curve, threshold=SOLVED_THRESHOLD):   ## Given evaluation returns over time, returns the first evaluation checkpoints,
+                                                                            ## eval return >= 195 
+    # returns first eval episode where curve >= threshold, else None
+    idx = np.where(eval_curve >= threshold)[0]
+    if len(idx) == 0:
+        return None
+    return int(eval_ep[idx[0]])
+
+
+def savefig(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, dpi=220)
+
+
+def plot_train_returns(ddqn_runs, dqn_runs):       ## Uses episode_return arrays from all seeds, produces DDQN vs DQN mean curves 
+                                                   ## For training performance + variability 
+    ddqn = align_min_length(ddqn_runs, "episode_return")
+    dqn  = align_min_length(dqn_runs, "episode_return")
+    m1, lo1, hi1 = mean_ci(ddqn)
+    m2, lo2, hi2 = mean_ci(dqn)
+
+    x = np.arange(len(m1))
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, m1, label="DDQN mean return")
+    plt.fill_between(x, lo1, hi1, alpha=0.2)
+    plt.plot(x, m2, label="DQN mean return")
+    plt.fill_between(x, lo2, hi2, alpha=0.2)
+    plt.axhline(SOLVED_THRESHOLD, linestyle="--", label=f"Solved ({SOLVED_THRESHOLD:.0f})")
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title("Training return (mean ± 95% CI across seeds)")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_1_train_return_ci.png"))
+    plt.show()
+
+
+def plot_eval_returns(ddqn_runs, dqn_runs):    ## Policy quality without exploration noise 
+    ddqn = align_min_length(ddqn_runs, "eval_return")
+    dqn  = align_min_length(dqn_runs, "eval_return")
+    m1, lo1, hi1 = mean_ci(ddqn)
+    m2, lo2, hi2 = mean_ci(dqn)
+
+    eval_ep = ddqn_runs[0]["eval_episode"][: len(m1)]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(eval_ep, m1, label="DDQN greedy eval")
+    plt.fill_between(eval_ep, lo1, hi1, alpha=0.2)
+    plt.plot(eval_ep, m2, label="DQN greedy eval")
+    plt.fill_between(eval_ep, lo2, hi2, alpha=0.2)
+    plt.axhline(SOLVED_THRESHOLD, linestyle="--", label=f"Solved ({SOLVED_THRESHOLD:.0f})")
+    plt.xlabel("Episode", **font, fontsize=15)
+    plt.ylabel("Evaluation return", **font, fontsize=15)
+    plt.title("Fig 1. Greedy policy evaluation (mean ± 95% CI across seeds)", **font, fontsize=20)
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_2_eval_return_ci.png"))
+    plt.show()
+
+
+# Replace ONLY your plot_q_proxy function with this version.
+# It fixes the mismatch by using each group's own x-axis (DDQN steps for DDQN curve, DQN steps for DQN curve)
+# and independently aligning within each group.
+
+def plot_q_proxy(ddqn_runs, dqn_runs):
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    def align_min_length_with_L(runs, key):
+        L = min(len(r[key]) for r in runs)
+        arr = np.stack([r[key][:L] for r in runs], axis=0)  # [S, L]
+        return arr, L
+
+    def mean_ci(arr, z=1.96):
+        mean = arr.mean(axis=0)
+        if arr.shape[0] > 1:
+            std = arr.std(axis=0, ddof=1)
+        else:
+            std = np.zeros_like(mean)
+        half = z * std / np.sqrt(max(arr.shape[0], 1))
+        return mean, mean - half, mean + half
+
+    # DDQN group (y and x aligned within DDQN)
+    ddqn_q, L1 = align_min_length_with_L(ddqn_runs, "avg_max_q")
+    m1, lo1, hi1 = mean_ci(ddqn_q)
+    ddqn_steps = ddqn_runs[0]["q_log_steps"][:L1]
+
+    # DQN group (y and x aligned within DQN)
+    dqn_q, L2 = align_min_length_with_L(dqn_runs, "avg_max_q")
+    m2, lo2, hi2 = mean_ci(dqn_q)
+    dqn_steps = dqn_runs[0]["q_log_steps"][:L2]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(ddqn_steps, m1, label="DDQN: E[max_a Q(s,a)] probe")
+    plt.fill_between(ddqn_steps, lo1, hi1, alpha=0.2)
+
+    plt.plot(dqn_steps, m2, label="DQN: E[max_a Q(s,a)] probe")
+    plt.fill_between(dqn_steps, lo2, hi2, alpha=0.2)
+
+    plt.xlabel("Environment steps", **font, fontsize=17)
+    plt.ylabel("Average max Q", **font, fontsize=17)
+    plt.title("Fig 2. Overestimation proxy on fixed probe states (mean ± 95% CI)", **font, fontsize=20)
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_3_q_overestimation_proxy.png"))
+    plt.show()
+
+
+
+def plot_loss(ddqn_runs, dqn_runs):
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    def align_min_length_with_L(runs, key):
+        L = min(len(r[key]) for r in runs)
+        if L == 0:
+            lengths = [len(r[key]) for r in runs]
+            raise ValueError(f"At least one run has empty '{key}' array. Lengths={lengths}")
+        arr = np.stack([r[key][:L] for r in runs], axis=0)  # [S, L]
+        return arr, L
+
+    def mean_ci(arr, z=1.96):
+        mean = arr.mean(axis=0)
+        if arr.shape[0] > 1:
+            std = arr.std(axis=0, ddof=1)
+        else:
+            std = np.zeros_like(mean)
+        half = z * std / np.sqrt(max(arr.shape[0], 1))
+        return mean, mean - half, mean + half
+
+    # DDQN group
+    ddqn_loss, L1 = align_min_length_with_L(ddqn_runs, "loss")
+    m1, lo1, hi1 = mean_ci(ddqn_loss)
+    x1 = np.arange(L1)
+
+    # DQN group
+    dqn_loss, L2 = align_min_length_with_L(dqn_runs, "loss")
+    m2, lo2, hi2 = mean_ci(dqn_loss)
+    x2 = np.arange(L2)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x1, m1, label="DDQN mean loss")
+    plt.fill_between(x1, lo1, hi1, alpha=0.2)
+
+    plt.plot(x2, m2, label="DQN mean loss")
+    plt.fill_between(x2, lo2, hi2, alpha=0.2)
+
+    plt.yscale("log")
+    plt.xlabel("Update step", **font, fontsize=17)
+    plt.ylabel("Huber loss (log scale)", **font, fontsize=17)
+    plt.title("Fig 3. Loss stability (mean ± 95% CI)", **font, fontsize=20)
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_4_loss_log_ci.png"))
+    plt.show()
+
+
+
+def pick_representative_ddqn_run(ddqn_runs):
+    # representative = median of final training returns
+    finals = [(float(r["episode_return"][-1]), i) for i, r in enumerate(ddqn_runs)]
+    finals.sort(key=lambda x: x[0])
+    return ddqn_runs[finals[len(finals)//2][1]]
+
+
+def plot_statespace(run, bins=70):
+    theta = run["vis_theta"]
+    theta_dot = run["vis_theta_dot"]
+    action = run["vis_action"]
+
+    th_min, th_max = np.percentile(theta, [1, 99])
+    td_min, td_max = np.percentile(theta_dot, [1, 99])
+
+    # Visitation density
+    plt.figure(figsize=(7, 5))
+    plt.hist2d(theta, theta_dot, bins=bins, range=[[th_min, th_max], [td_min, td_max]])
+    plt.xlabel("Pole angle (theta)")
+    plt.ylabel("Pole angular velocity (theta_dot)")
+    plt.title("DDQN: state visitation density (greedy policy)")
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_5a_statespace_visitation.png"))
+    plt.show()
+
+    # Majority action map over bins
+    xedges = np.linspace(th_min, th_max, bins + 1)
+    yedges = np.linspace(td_min, td_max, bins + 1)
+    xi = np.clip(np.digitize(theta, xedges) - 1, 0, bins - 1)
+    yi = np.clip(np.digitize(theta_dot, yedges) - 1, 0, bins - 1)
+
+    counts0 = np.zeros((bins, bins), dtype=np.int32)
+    counts1 = np.zeros((bins, bins), dtype=np.int32)
+    for xb, yb, a in zip(xi, yi, action):
+        if a == 0:
+            counts0[xb, yb] += 1
+        else:
+            counts1[xb, yb] += 1
+
+    majority = (counts1 > counts0).astype(np.int32)
+
+    plt.figure(figsize=(7, 5))
+    plt.imshow(
+        majority.T,
+        origin="lower",
+        aspect="auto",
+        extent=[th_min, th_max, td_min, td_max],
+        interpolation="nearest",
+    )
+    plt.xlabel("Pole angle (theta)")
+    plt.ylabel("Pole angular velocity (theta_dot)")
+    plt.title("DDQN: greedy action map (0=left, 1=right)")
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_5b_statespace_action_map.png"))
+    plt.show()
+
+
+def summary_stats(ddqn_runs, dqn_runs):
+    # Episodes-to-solve from evaluation curve, per seed
+    ddqn_solve = []
+    dqn_solve = []
+
+    for r in ddqn_runs:
+        ep = r["eval_episode"]
+        curve = r["eval_return"]
+        ddqn_solve.append(first_solved_episode(ep, curve))
+
+    for r in dqn_runs:
+        ep = r["eval_episode"]
+        curve = r["eval_return"]
+        dqn_solve.append(first_solved_episode(ep, curve))
+
+    def mean_std_ignore_none(xs):
+        xs2 = [x for x in xs if x is not None]
+        if len(xs2) == 0:
+            return None, None, 0
+        return float(np.mean(xs2)), float(np.std(xs2, ddof=1)) if len(xs2) > 1 else 0.0, len(xs2)
+
+    ddqn_m, ddqn_s, ddqn_n = mean_std_ignore_none(ddqn_solve)
+    dqn_m, dqn_s, dqn_n = mean_std_ignore_none(dqn_solve)
+
+    # Final eval return (last point)
+    ddqn_final_eval = [float(r["eval_return"][-1]) for r in ddqn_runs]
+    dqn_final_eval  = [float(r["eval_return"][-1]) for r in dqn_runs]
+
+    # Q proxy comparison at final logged point
+    ddqn_q_final = [float(r["avg_max_q"][-1]) for r in ddqn_runs]
+    dqn_q_final  = [float(r["avg_max_q"][-1]) for r in dqn_runs]
+
+    print("=== Summary for report ===")
+    print(f"Seeds: DDQN={len(ddqn_runs)} | DQN={len(dqn_runs)}")
+    print("")
+    print("Episodes-to-solve (first eval episode with mean >= 195):")
+    print(f"  DDQN: {ddqn_solve}")
+    print(f"  DQN : {dqn_solve}")
+    if ddqn_m is not None:
+        print(f"  DDQN solved in {ddqn_m:.1f} ± {ddqn_s:.1f} episodes (over {ddqn_n} solved seeds)")
+    else:
+        print("  DDQN: not solved in eval for any seed")
+    if dqn_m is not None:
+        print(f"  DQN  solved in {dqn_m:.1f} ± {dqn_s:.1f} episodes (over {dqn_n} solved seeds)")
+    else:
+        print("  DQN: not solved in eval for any seed")
+    print("")
+    print("Final greedy evaluation return:")
+    print(f"  DDQN: mean={np.mean(ddqn_final_eval):.2f}, std={np.std(ddqn_final_eval, ddof=1) if len(ddqn_final_eval)>1 else 0.0:.2f}")
+    print(f"  DQN : mean={np.mean(dqn_final_eval):.2f}, std={np.std(dqn_final_eval, ddof=1) if len(dqn_final_eval)>1 else 0.0:.2f}")
+    print("")
+    print("Overestimation proxy (final E[max Q] on probe states):")
+    print(f"  DDQN: mean={np.mean(ddqn_q_final):.4f}, std={np.std(ddqn_q_final, ddof=1) if len(ddqn_q_final)>1 else 0.0:.4f}")
+    print(f"  DQN : mean={np.mean(dqn_q_final):.4f}, std={np.std(dqn_q_final, ddof=1) if len(dqn_q_final)>1 else 0.0:.4f}")
+
+
+def main():
+    ddqn_runs, ddqn_paths = load_runs(DDQN_GLOB)
+    dqn_runs, dqn_paths   = load_runs(DQN_GLOB)
+
+    print("Loaded DDQN runs:")
+    for p in ddqn_paths:
+        print(" ", p)
+    print("Loaded DQN runs:")
+    for p in dqn_paths:
+        print(" ", p)
+
+    summary_stats(ddqn_runs, dqn_runs)
+
+    plot_train_returns(ddqn_runs, dqn_runs)
+    plot_eval_returns(ddqn_runs, dqn_runs)
+    plot_q_proxy(ddqn_runs, dqn_runs)
+    plot_loss(ddqn_runs, dqn_runs)
+
+    rep = pick_representative_ddqn_run(ddqn_runs)
+    plot_statespace(rep)
+
+
+if __name__ == "__main__":
+    main()
+
+import os, glob
+import numpy as np
+
+RUN_DIR = "runs_cartpole"
+OUT_DIR = RUN_DIR
+SOLVED_THRESHOLD = 195.0
+
+# Load runs
+ddqn_paths = sorted(glob.glob(os.path.join(RUN_DIR, "ddqn_cartpole_seed*.npz")))
+dqn_paths  = sorted(glob.glob(os.path.join(RUN_DIR, "dqn_cartpole_seed*.npz")))
+
+ddqn_runs = [np.load(p, allow_pickle=True) for p in ddqn_paths]
+dqn_runs  = [np.load(p, allow_pickle=True) for p in dqn_paths]
+
+print("DDQN files:", len(ddqn_runs))
+print("DQN files :", len(dqn_runs))
+print("Example DDQN keys:", ddqn_runs[0].files)
+
+# Now call your plotting bundle
+add_plots(ddqn_runs, dqn_runs, OUT_DIR, SOLVED_THRESHOLD)
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+def rolling_std_1d(x, window: int):
+    x = np.asarray(x, dtype=np.float64)
+    if window <= 1:
+        return np.zeros_like(x, dtype=np.float64)
+    if len(x) < window:
+        return np.array([], dtype=np.float64)
+    out = np.empty(len(x) - window + 1, dtype=np.float64)
+    for i in range(len(out)):
+        out[i] = np.std(x[i:i + window], ddof=0)
+    return out
+
+def mean_ci(arr, z=1.96):
+    arr = np.asarray(arr, dtype=np.float64)
+    mean = arr.mean(axis=0)
+    if arr.shape[0] > 1:
+        std = arr.std(axis=0, ddof=1)
+    else:
+        std = np.zeros_like(mean)
+    half = z * std / np.sqrt(max(arr.shape[0], 1))
+    return mean, mean - half, mean + half
+
+def align_min_length(runs, key):
+    lengths = [len(r[key]) for r in runs]
+    if min(lengths) == 0:
+        raise ValueError(f"At least one run has empty '{key}' array. Lengths={lengths}")
+    L = min(lengths)
+    return np.stack([r[key][:L] for r in runs], axis=0)
+
+def savefig(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plt.savefig(path, dpi=220)
+
+def episodes_to_solve_from_eval(run, threshold):
+    eval_ep = np.asarray(run["eval_episode"])
+    eval_ret = np.asarray(run["eval_return"])
+    idx = np.where(eval_ret >= threshold)[0]
+    if len(idx) == 0:
+        return None
+    return int(eval_ep[idx[0]])
+
+def plot_rolling_return_std(ddqn_runs, dqn_runs, OUT_DIR, window=20):
+    ddqn_arr = align_min_length(ddqn_runs, "episode_return")  # [S, L]
+    dqn_arr  = align_min_length(dqn_runs,  "episode_return")  # [S, L]
+
+    # Rolling std per seed; all same length after alignment
+    ddqn_roll = np.stack([rolling_std_1d(ddqn_arr[i], window) for i in range(ddqn_arr.shape[0])], axis=0)
+    dqn_roll  = np.stack([rolling_std_1d(dqn_arr[i],  window) for i in range(dqn_arr.shape[0])], axis=0)
+
+    # If window is too large, ddqn_roll could be empty; hard fail with a clear message
+    if ddqn_roll.shape[1] == 0 or dqn_roll.shape[1] == 0:
+        raise ValueError(f"Rolling window too large for available episode length. window={window}")
+
+    m1, lo1, hi1 = mean_ci(ddqn_roll)
+    m2, lo2, hi2 = mean_ci(dqn_roll)
+
+    x = np.arange(window - 1, window - 1 + len(m1))
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, m1, label=f"DDQN rolling std (w={window})")
+    plt.fill_between(x, lo1, hi1, alpha=0.2)
+    plt.plot(x, m2, label=f"DQN rolling std (w={window})")
+    plt.fill_between(x, lo2, hi2, alpha=0.2)
+    plt.xlabel("Episode")
+    plt.ylabel("Rolling std of return")
+    plt.title("Training stability: rolling return variance (mean ± 95% CI)")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_6_rolling_return_std.png"))
+    plt.show()
+
+def plot_episodes_to_solve_cdf(ddqn_runs, dqn_runs, OUT_DIR, threshold=195.0, include_unsolved=False):
+    """
+    If include_unsolved=False:
+      denominator is 'solved seeds only' (common in RL papers)
+    If include_unsolved=True:
+      denominator is 'all seeds' and unsolved are treated as +inf (CDF plateaus < 1)
+    """
+    ddqn_solve = [episodes_to_solve_from_eval(r, threshold) for r in ddqn_runs]
+    dqn_solve  = [episodes_to_solve_from_eval(r, threshold) for r in dqn_runs]
+
+    ddqn_not = sum(x is None for x in ddqn_solve)
+    dqn_not  = sum(x is None for x in dqn_solve)
+
+    if include_unsolved:
+        # Use a finite sentinel beyond max episode for plotting
+        max_ep_ddqn = int(np.max([np.max(r["eval_episode"]) for r in ddqn_runs]))
+        max_ep_dqn  = int(np.max([np.max(r["eval_episode"]) for r in dqn_runs]))
+        sentinel = max(max_ep_ddqn, max_ep_dqn) + 1
+
+        ddqn_vals = sorted([x if x is not None else sentinel for x in ddqn_solve])
+        dqn_vals  = sorted([x if x is not None else sentinel for x in dqn_solve])
+
+        x1 = np.array(ddqn_vals, dtype=np.int32)
+        y1 = np.arange(1, len(x1) + 1) / len(x1)
+
+        x2 = np.array(dqn_vals, dtype=np.int32)
+        y2 = np.arange(1, len(x2) + 1) / len(x2)
+
+        title_extra = " (unsolved included; plateau shows reliability)"
+    else:
+        ddqn_vals = sorted([x for x in ddqn_solve if x is not None])
+        dqn_vals  = sorted([x for x in dqn_solve if x is not None])
+
+        title_extra = " (solved seeds only)"
+
+    plt.figure(figsize=(8, 5))
+
+    if len(ddqn_vals) > 0:
+        x1 = np.array(ddqn_vals, dtype=np.int32)
+        y1 = np.arange(1, len(x1) + 1) / len(x1)
+        plt.step(x1, y1, where="post", label="DDQN")
+    else:
+        plt.plot([], [], label="DDQN (no solved seeds)")
+
+    if len(dqn_vals) > 0:
+        x2 = np.array(dqn_vals, dtype=np.int32)
+        y2 = np.arange(1, len(x2) + 1) / len(x2)
+        plt.step(x2, y2, where="post", label="DQN")
+    else:
+        plt.plot([], [], label="DQN (no solved seeds)")
+
+    plt.xlabel("Episode", **font, fontsize=17)
+    plt.ylabel("Fraction solved", **font, fontsize=17)
+    plt.ylim(0, 1.01)
+    plt.title(
+        f"Fig 4. Episodes-to-solve CDF (threshold={threshold:.0f}){title_extra} \n" 
+        f"DDQN unsolved: {ddqn_not}/{len(ddqn_solve)} | "
+        f"DQN unsolved: {dqn_not}/{len(dqn_solve)}", **font, fontsize=19
+    )
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(OUT_DIR, "fig_7_solved_cdf.png"))
+    plt.show()
+
+def add_plots(ddqn_runs, dqn_runs, OUT_DIR, SOLVED_THRESHOLD=195.0):
+    plot_rolling_return_std(ddqn_runs, dqn_runs, OUT_DIR, window=20)
+    plot_episodes_to_solve_cdf(ddqn_runs, dqn_runs, OUT_DIR, threshold=SOLVED_THRESHOLD, include_unsolved=False)
+    # Optional alternative CDF (more honest reliability plot)
+    plot_episodes_to_solve_cdf(ddqn_runs, dqn_runs, OUT_DIR, threshold=SOLVED_THRESHOLD, include_unsolved=True)
+
+import glob, numpy as np
+
+bad_npy = []
+for p in glob.glob("**/*.npy", recursive=True):
+    try:
+        _ = np.load(p, allow_pickle=False)
+    except Exception as e:
+        bad_npy.append((p, type(e).__name__))
+bad_npy[:20], len(bad_npy)
+
+# Create GIFs from your saved frame arrays (.npy)
+# Uses your existing files:
+# - cartpole_ddqn_frames.npy
+# - cartpole_ddqn_early.npy / mid / late
+# - cartpole_ddqn_all_phases_frames.npy
+#
+# Output:
+# - cartpole_ddqn.gif
+# - cartpole_ddqn_all_phases.gif
+# - cartpole_ddqn_early.gif / mid / late (optional)
+
+import numpy as np
+import imageio.v2 as imageio
+
+def npy_to_gif(npy_path, gif_path, fps=25, max_frames=None, stride=1):
+    frames = np.load(npy_path, allow_pickle=False)
+
+    if max_frames is not None:
+        frames = frames[:max_frames]
+
+    if stride > 1:
+        frames = frames[::stride]
+
+    duration = 1.0 / max(int(fps), 1)
+    imageio.mimsave(gif_path, frames, duration=duration)
+    print(f"Saved {gif_path} | frames={len(frames)} | fps={fps} | stride={stride}")
+
+# 1) Single episode GIF (your earlier recording)
+npy_to_gif("cartpole_ddqn_frames.npy", "cartpole_ddqn.gif", fps=25)
+
+# 2) All phases concatenated (early+mid+late)
+# If this is too large, set max_frames or stride=2/3
+npy_to_gif("cartpole_ddqn_all_phases_frames.npy", "cartpole_ddqn_all_phases.gif", fps=25, stride=2)
+
+# 3) Optional: individual phase GIFs
+npy_to_gif("cartpole_ddqn_early.npy", "cartpole_ddqn_early.gif", fps=25)
+npy_to_gif("cartpole_ddqn_mid.npy", "cartpole_ddqn_mid.gif", fps=25, stride=2)
+npy_to_gif("cartpole_ddqn_late.npy", "cartpole_ddqn_late.gif", fps=25)
+
+
+
