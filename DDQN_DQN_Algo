@@ -1,0 +1,555 @@
+import os
+import glob
+import math
+import random
+from dataclasses import dataclass
+from collections import deque
+
+import numpy as np
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+### Reproducibility utilities
+# Forces all randomness sources to produce the same sequence every run 
+# Same seed gives the same weights, giving the same learning curves 
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+device = torch.device("cpu")
+
+## Networks
+# Used for the online network and the target network in DQN and DDQN 
+# This network takes a state s, outputs Q-values for all actions, trained by TD learning 
+
+
+class QNetwork(nn.Module):              ## Defines a PyTorch Neuroal Network Module 
+    def __init__(self, state_dim: int, action_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),      ## Maps the 4-dimentional state into a 128-dimensional feature space 
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+## Replay Buffer
+# Defines a container for storing transitions (s,a,r,s',done)
+# Randomises training data 
+# Each entry represents one bellman backup target 
+
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.buffer = deque(maxlen=capacity)
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def push(self, s, a, r, s2, done):
+        self.buffer.append((s, a, r, s2, done))
+
+    def sample(self, batch_size: int, device):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, s2, d = map(np.array, zip(*batch))
+
+        s = torch.as_tensor(s, dtype=torch.float32, device=device)
+        s2 = torch.as_tensor(s2, dtype=torch.float32, device=device)
+        a = torch.as_tensor(a, dtype=torch.int64, device=device).unsqueeze(1)   # [B,1]
+        r = torch.as_tensor(r, dtype=torch.float32, device=device).unsqueeze(1) # [B,1]
+        d = torch.as_tensor(d, dtype=torch.float32, device=device).unsqueeze(1) # [B,1] 1.0 if done else 0.0
+        return s, a, r, s2, d
+
+## Configuration
+# Config is a container for every decision that affects learning 
+# All experiments share identical hyperparameters defined in a single configuration object, which allows fair comparison between DQN and DDQN
+# Defines what is being tested, how long, under what exploration regime, and how results are measured
+-
+@dataclass
+class Config:
+    env_id: str = "CartPole-v1"
+    gamma: float = 0.99         ### discount factor - near 1, long term planning 
+    lr: float = 1e-3
+    buffer_size: int = 50_000        # Memory capacity 
+    batch_size: int = 64             # Samples per update 
+    min_buffer: int = 1_000          # Prevents lerning from tiny,biased datasets 
+    max_episodes: int = 400          # Upper bound 
+    target_update_freq: int = 1_000  # steps
+    epsilon_start: float = 1.0       # Defines an exponential decay over steps (starts fully random -- decays smoothly -- converge to near-greedy)
+    epsilon_end: float = 0.01
+    epsilon_decay: float = 500.0     # steps (exp decay)
+    reward_shaping: bool = True      # penalty when falling early --- speeds up learning, does not change optimal policy 
+
+    # Logging / evaluation
+    eval_every_episodes: int = 10    # Periodic greedy evaluation (epsilon = 0)
+    eval_episodes: int = 5
+    log_q_every_steps: int = 250     #### Logs Q-value scale to detect overestimation 
+
+    # Probe set for Q-scale (fixed states)
+    probe_states: int = 5_000        # Number of fixed states used to compute E[max Q]
+
+
+def epsilon_by_step(cfg: Config, step: int) -> float:
+    return cfg.epsilon_end + (cfg.epsilon_start - cfg.epsilon_end) * math.exp(-1.0 * step / cfg.epsilon_decay) 
+
+## Evaluation
+# Policy performance was evaluated periodically using a greedy policy over 5 episodes, with gradients disabled, ensuring that reported returns 
+# reflect the learned value function rather than exploration effects 
+# Function evalues the current greedy policy 
+
+@torch.no_grad()
+def evaluate_policy(env_id: str, q_net: nn.Module, device, n_episodes: int = 5, max_steps: int = 1000):
+    env = gym.make(env_id)
+    q_net.eval()
+    returns = []
+    lengths = []
+    for _ in range(n_episodes):
+        s, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        steps = 0
+        while not done and steps < max_steps:
+            s_t = torch.as_tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+            a = int(q_net(s_t).argmax(dim=1).item())
+            s2, r, terminated, truncated, _ = env.step(a)
+            done = terminated or truncated
+            ep_ret += float(r)
+            s = s2
+            steps += 1
+        returns.append(ep_ret)
+        lengths.append(steps)
+    env.close()
+    return float(np.mean(returns)), float(np.mean(lengths))
+
+# -----------------------------
+# State-space collection for heatmaps
+# -----------------------------
+@torch.no_grad()
+def collect_state_action_samples(env_id: str, q_net: nn.Module, device, n_steps: int = 20_000):
+    """
+    Collect greedy-policy visitation for (pole angle, pole angular velocity),
+    and greedy action map over visited states.
+    """
+    env = gym.make(env_id)
+    q_net.eval()
+
+    angles = []
+    ang_vels = []
+    actions = []
+
+    s, _ = env.reset()
+    for _ in range(n_steps):
+        s_t = torch.as_tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+        q = q_net(s_t)
+        a = int(q.argmax(dim=1).item())
+
+        # CartPole state = [x, x_dot, theta, theta_dot]
+        theta = float(s[2])
+        theta_dot = float(s[3])
+
+        angles.append(theta)
+        ang_vels.append(theta_dot)
+        actions.append(a)
+
+        s2, _, terminated, truncated, _ = env.step(a)
+        done = terminated or truncated
+        if done:
+            s, _ = env.reset()
+        else:
+            s = s2
+
+    env.close()
+    return np.array(angles), np.array(ang_vels), np.array(actions)
+
+
+# Training (DQN or DDQN)
+
+def run_training(seed: int, algo: str, cfg: Config, out_dir: str, device):
+    assert algo in {"dqn", "ddqn"}
+
+    set_seed(seed)
+
+    env = gym.make(cfg.env_id)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+
+    q_net = QNetwork(state_dim, action_dim).to(device)
+    target_net = QNetwork(state_dim, action_dim).to(device)
+    target_net.load_state_dict(q_net.state_dict())
+    target_net.eval()
+
+    optimizer = optim.Adam(q_net.parameters(), lr=cfg.lr)
+    criterion = nn.SmoothL1Loss()  # Huber (more stable than MSE)
+
+    rb = ReplayBuffer(cfg.buffer_size)
+
+    # Fixed probe set of states (collected once with a random policy)
+    # Used to track E[max_a Q(s,a)] as an overestimation proxy
+    probe = []
+    s, _ = env.reset(seed=seed)
+    for _ in range(cfg.probe_states):
+        a = env.action_space.sample()
+        s2, _, terminated, truncated, _ = env.step(a)
+        probe.append(s)
+        done = terminated or truncated
+        if done:
+            s, _ = env.reset()
+        else:
+            s = s2
+    probe_states = torch.as_tensor(np.array(probe, dtype=np.float32), device=device)
+
+    global_step = 0
+
+    # Logs
+    ep_returns = []
+    ep_lengths = []
+    eps_trace = []         # per episode snapshot
+    loss_trace = []        # per update step
+    avg_max_q_trace = []   # per log interval
+    q_log_steps = []       # x-axis for avg_max_q
+    eval_returns = []
+    eval_lengths = []
+    eval_episodes = []
+
+    for ep in range(cfg.max_episodes):
+        s, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        steps = 0
+
+        while not done:
+            global_step += 1
+            steps += 1
+            eps = epsilon_by_step(cfg, global_step)
+
+            if random.random() < eps:
+                a = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    s_t = torch.as_tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+                    a = int(q_net(s_t).argmax(dim=1).item())
+
+            s2, r, terminated, truncated, _ = env.step(a)
+            done = terminated or truncated
+
+            # Reward shaping (optional): penalise failure early
+            if cfg.reward_shaping and done and ep_ret < 195:   ## penalises early failure slighly, speeds up learning 
+                r = -1.0
+
+            rb.push(s, a, float(r), s2, float(done))
+            s = s2
+            ep_ret += float(r)
+
+            if len(rb) >= cfg.min_buffer:
+                states, actions, rewards, next_states, dones = rb.sample(cfg.batch_size, device=device)
+
+                # Q(s,a)
+                q_sa = q_net(states).gather(1, actions)  # [B,1]       ## Online Q-values for taken actions, gives Q(s,a)
+
+                with torch.no_grad():
+                    if algo == "ddqn":
+                        # action selection: online; evaluation: target
+                        next_actions = q_net(next_states).argmax(dim=1, keepdim=True)  # Action selection using online net 
+                        q_next = target_net(next_states).gather(1, next_actions)       # Action evaluation uses target net 
+                    else:
+                        # DQN: max over target network directly
+                        q_next = target_net(next_states).max(dim=1, keepdim=True).values  # [B,1]
+
+                    target = rewards + cfg.gamma * (1.0 - dones) * q_next  # [B,1]
+
+                loss = criterion(q_sa, target)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(q_net.parameters(), 10.0)
+                optimizer.step()
+
+                loss_trace.append(float(loss.item()))
+
+                if global_step % cfg.target_update_freq == 0:
+                    target_net.load_state_dict(q_net.state_dict())
+
+                if global_step % cfg.log_q_every_steps == 0:
+                    with torch.no_grad():
+                        avg_max_q = q_net(probe_states).max(dim=1).values.mean().item()
+                    avg_max_q_trace.append(float(avg_max_q))
+                    q_log_steps.append(int(global_step))
+
+        ep_returns.append(float(ep_ret))
+        ep_lengths.append(int(steps))
+        eps_trace.append(float(eps))
+
+        # Evaluation (greedy, no epsilon)
+        if (ep + 1) % cfg.eval_every_episodes == 0:
+            mean_eval_ret, mean_eval_len = evaluate_policy(
+                cfg.env_id, q_net, device, n_episodes=cfg.eval_episodes
+            )
+            eval_returns.append(mean_eval_ret)
+            eval_lengths.append(mean_eval_len)
+            eval_episodes.append(ep + 1)
+
+    env.close()
+
+    # Late-policy state-space diagnostics
+    angles, ang_vels, actions = collect_state_action_samples(cfg.env_id, q_net, device, n_steps=20_000)
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{algo}_cartpole_seed{seed}.npz")
+    np.savez(
+        path,
+        seed=seed,
+        algo=algo,
+        episode_return=np.array(ep_returns, dtype=np.float32),
+        episode_length=np.array(ep_lengths, dtype=np.int32),
+        epsilon=np.array(eps_trace, dtype=np.float32),
+        loss=np.array(loss_trace, dtype=np.float32),
+        avg_max_q=np.array(avg_max_q_trace, dtype=np.float32),
+        q_log_steps=np.array(q_log_steps, dtype=np.int32),
+        eval_return=np.array(eval_returns, dtype=np.float32),
+        eval_length=np.array(eval_lengths, dtype=np.float32),
+        eval_episode=np.array(eval_episodes, dtype=np.int32),
+        # state-space diagnostics
+        vis_theta=np.array(angles, dtype=np.float32),
+        vis_theta_dot=np.array(ang_vels, dtype=np.float32),
+        vis_action=np.array(actions, dtype=np.int32),
+    )
+    return path
+
+# -----------------------------
+# Aggregation + plotting
+# -----------------------------
+def load_runs(pattern: str):
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f"No files matched pattern: {pattern}")
+    return [np.load(p, allow_pickle=True) for p in paths]
+
+
+def align_min_length(runs, key: str):
+    L = min(len(r[key]) for r in runs)
+    arr = np.stack([r[key][:L] for r in runs], axis=0)  # [S,L]
+    return arr
+
+
+def mean_ci(arr: np.ndarray, z: float = 1.96):
+    mean = arr.mean(axis=0)
+    std = arr.std(axis=0, ddof=1) if arr.shape[0] > 1 else np.zeros_like(mean)
+    n = arr.shape[0]
+    half = z * std / np.sqrt(max(n, 1))
+    return mean, mean - half, mean + half
+
+
+def plot_learning_curves(ddqn_runs, dqn_runs, out_path=None):
+    # Figure 1: Train returns (mean ± 95% CI)
+    ddqn_rets = align_min_length(ddqn_runs, "episode_return")
+    dqn_rets = align_min_length(dqn_runs, "episode_return")
+    m1, lo1, hi1 = mean_ci(ddqn_rets)
+    m2, lo2, hi2 = mean_ci(dqn_rets)
+
+    x = np.arange(len(m1))
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, m1, label="DDQN mean return")
+    plt.fill_between(x, lo1, hi1, alpha=0.2)
+    plt.plot(x, m2, label="DQN mean return")
+    plt.fill_between(x, lo2, hi2, alpha=0.2)
+    plt.axhline(195, linestyle="--", label="Solved threshold (195)")
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title("Training performance (mean ± 95% CI across seeds)")
+    plt.legend()
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200)
+    plt.show()
+
+
+def plot_eval_curves(ddqn_runs, dqn_runs, out_path=None):
+    # Eval episodes may be aligned by index since all runs use same schedule
+    ddqn_eval = align_min_length(ddqn_runs, "eval_return")
+    dqn_eval = align_min_length(dqn_runs, "eval_return")
+    m1, lo1, hi1 = mean_ci(ddqn_eval)
+    m2, lo2, hi2 = mean_ci(dqn_eval)
+
+    eval_ep = ddqn_runs[0]["eval_episode"][: len(m1)]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(eval_ep, m1, label="DDQN greedy eval")
+    plt.fill_between(eval_ep, lo1, hi1, alpha=0.2)
+    plt.plot(eval_ep, m2, label="DQN greedy eval")
+    plt.fill_between(eval_ep, lo2, hi2, alpha=0.2)
+    plt.axhline(195, linestyle="--", label="Solved threshold (195)")
+    plt.xlabel("Episode")
+    plt.ylabel("Evaluation return")
+    plt.title("Greedy policy evaluation (separates exploration noise from skill)")
+    plt.legend()
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200)
+    plt.show()
+
+
+def plot_q_overestimation_proxy(ddqn_runs, dqn_runs, out_path=None):
+    # avg_max_q tracked at q_log_steps
+    ddqn_q = align_min_length(ddqn_runs, "avg_max_q")
+    dqn_q = align_min_length(dqn_runs, "avg_max_q")
+    m1, lo1, hi1 = mean_ci(ddqn_q)
+    m2, lo2, hi2 = mean_ci(dqn_q)
+
+    steps = ddqn_runs[0]["q_log_steps"][: len(m1)]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, m1, label="DDQN: E[max_a Q(s,a)] on fixed probe states")
+    plt.fill_between(steps, lo1, hi1, alpha=0.2)
+    plt.plot(steps, m2, label="DQN: E[max_a Q(s,a)] on fixed probe states")
+    plt.fill_between(steps, lo2, hi2, alpha=0.2)
+    plt.xlabel("Environment steps")
+    plt.ylabel("Average max Q")
+    plt.title("Overestimation proxy: DDQN should inflate less than DQN")
+    plt.legend()
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200)
+    plt.show()
+
+
+def plot_loss_diagnostics(ddqn_runs, dqn_runs, out_path=None):
+    # Loss is per update-step; align and plot mean ± CI
+    ddqn_loss = align_min_length(ddqn_runs, "loss")
+    dqn_loss = align_min_length(dqn_runs, "loss")
+    m1, lo1, hi1 = mean_ci(ddqn_loss)
+    m2, lo2, hi2 = mean_ci(dqn_loss)
+
+    x = np.arange(len(m1))
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, m1, label="DDQN mean loss")
+    plt.fill_between(x, lo1, hi1, alpha=0.2)
+    plt.plot(x, m2, label="DQN mean loss")
+    plt.fill_between(x, lo2, hi2, alpha=0.2)
+    plt.yscale("log")
+    plt.xlabel("Update step")
+    plt.ylabel("Huber loss (log scale)")
+    plt.title("Stability diagnostic: loss (mean ± 95% CI)")
+    plt.legend()
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200)
+    plt.show()
+
+
+def plot_state_space_maps(run, title_prefix="", out_prefix=None, bins=70):
+    """
+    Two maps over (theta, theta_dot):
+    - Visitation density (hist2d)
+    - Greedy action map (majority action per bin)
+    """
+    theta = run["vis_theta"]
+    theta_dot = run["vis_theta_dot"]
+    action = run["vis_action"]
+
+    # Set bounds to focus on typical region (avoid extreme outliers)
+    th_min, th_max = np.percentile(theta, [1, 99])
+    td_min, td_max = np.percentile(theta_dot, [1, 99])
+
+    # Density
+    plt.figure(figsize=(7, 5))
+    plt.hist2d(theta, theta_dot, bins=bins, range=[[th_min, th_max], [td_min, td_max]])
+    plt.xlabel("Pole angle (theta)")
+    plt.ylabel("Pole angular velocity (theta_dot)")
+    plt.title(f"{title_prefix}State visitation density (greedy policy)")
+    plt.tight_layout()
+    if out_prefix:
+        plt.savefig(f"{out_prefix}_visitation.png", dpi=200)
+    plt.show()
+
+    # Action map: compute majority action per bin
+    xedges = np.linspace(th_min, th_max, bins + 1)
+    yedges = np.linspace(td_min, td_max, bins + 1)
+    xi = np.clip(np.digitize(theta, xedges) - 1, 0, bins - 1)
+    yi = np.clip(np.digitize(theta_dot, yedges) - 1, 0, bins - 1)
+
+    counts0 = np.zeros((bins, bins), dtype=np.int32)
+    counts1 = np.zeros((bins, bins), dtype=np.int32)
+    for xbin, ybin, a in zip(xi, yi, action):
+        if a == 0:
+            counts0[xbin, ybin] += 1
+        else:
+            counts1[xbin, ybin] += 1
+
+    majority = (counts1 > counts0).astype(np.int32)
+
+    plt.figure(figsize=(7, 5))
+    plt.imshow(
+        majority.T,
+        origin="lower",
+        aspect="auto",
+        extent=[th_min, th_max, td_min, td_max],
+        interpolation="nearest",
+    )
+    plt.xlabel("Pole angle (theta)")
+    plt.ylabel("Pole angular velocity (theta_dot)")
+    plt.title(f"{title_prefix}Greedy action map (0=left, 1=right)")
+    plt.tight_layout()
+    if out_prefix:
+        plt.savefig(f"{out_prefix}_actionmap.png", dpi=200)
+    plt.show()
+
+
+# Main entry (multi-seed)
+# Runs a full multi-seed DQN vs DDQN experiment, saves logs as npz files 
+
+def run_all(
+    seeds=(0, 1, 2, 3, 4),
+    out_dir="runs_cartpole",
+    device=None,
+):
+    cfg = Config()
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    ddqn_paths = []
+    dqn_paths = []
+
+    for seed in seeds:
+        ddqn_paths.append(run_training(seed, "ddqn", cfg, out_dir, device))
+        dqn_paths.append(run_training(seed, "dqn", cfg, out_dir, device))
+
+    ddqn_runs = load_runs(os.path.join(out_dir, "ddqn_cartpole_seed*.npz"))
+    dqn_runs = load_runs(os.path.join(out_dir, "dqn_cartpole_seed*.npz"))
+
+    plot_learning_curves(ddqn_runs, dqn_runs, out_path=os.path.join(out_dir, "fig1_train_returns.png"))
+    plot_eval_curves(ddqn_runs, dqn_runs, out_path=os.path.join(out_dir, "fig2_eval_returns.png"))
+    plot_q_overestimation_proxy(ddqn_runs, dqn_runs, out_path=os.path.join(out_dir, "fig3_q_proxy.png"))
+    plot_loss_diagnostics(ddqn_runs, dqn_runs, out_path=os.path.join(out_dir, "fig4_loss.png"))
+
+    # State-space maps from one representative run (median final return among DDQN runs)
+    final_returns = [(float(r["episode_return"][-1]), i) for i, r in enumerate(ddqn_runs)]
+    final_returns.sort(key=lambda x: x[0])
+    rep_idx = final_returns[len(final_returns) // 2][1]
+    rep = ddqn_runs[rep_idx]
+    plot_state_space_maps(
+        rep,
+        title_prefix="DDQN: ",
+        out_prefix=os.path.join(out_dir, "fig5_ddqn_statespace"),
+    )
+
+    return out_dir
+
+
+# If running as a script:
+if __name__ == "__main__":
+    run_all(seeds=(0, 1, 2, 3, 4), out_dir="runs_cartpole")
+
+
